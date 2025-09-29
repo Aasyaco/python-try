@@ -107,7 +107,7 @@ jobs:
             --with-lto \
             --with-computed-gotos \
             --with-build-python=$(which python3) \
-            --build=$(./config.guess) \
+            --build=arm64-apple-darwin \
             --host=aarch64-linux-android
 
       - name: Package as DEB
