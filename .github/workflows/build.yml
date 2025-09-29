@@ -77,6 +77,11 @@ jobs:
           echo "LIBRARY_PATH=$SYSROOT/lib" >> $GITHUB_ENV
           echo "LD_LIBRARY_PATH=$SYSROOT/lib" >> $GITHUB_ENV
 
+      - name: Install Python 3.13 for build
+        run: |
+          brew install python@3.13
+          echo "PATH=/opt/homebrew/opt/python@3.13/bin:$PATH" >> $GITHUB_PATH
+
       - name: Build CPython using android.py
         working-directory: cpython-3.13/Android
         run: |
@@ -88,7 +93,7 @@ jobs:
             --enable-optimizations \
             --with-lto \
             --with-computed-gotos \
-            --with-build-python=/usr/bin/python3 \
+            --with-build-python=$(which python3) \
             --build=arm64-apple-darwin \
             --host=aarch64-linux-android
 
