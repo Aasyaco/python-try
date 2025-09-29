@@ -1,0 +1,125 @@
+name: Build Python 3.13 (3.13 branch) for Termux aarch64
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-android:
+    runs-on: macos-14
+    timeout-minutes: 180
+    env:
+      PKG_NAME: python
+      PKG_VERSION: 3.13.7
+      ARCH: aarch64
+      SYSROOT: ${{ github.workspace }}/android-libs/aarch64-linux-android
+      DEB_DIR: ${{ github.workspace }}/deb_build
+
+    steps:
+      - name: Checkout CPython repo (3.13 branch)
+        uses: actions/checkout@v5
+        with:
+          repository: python/cpython
+          ref: 3.13
+          path: cpython-3.13
+
+      - name: Install dependencies
+        run: |
+          brew update
+          for dep in pkg-config readline mpdecimal llvm lld dpkg gzip bzip2 xz; do
+            if ! brew list $dep >/dev/null 2>&1; then
+              brew install $dep
+            fi
+          done
+          brew link llvm --force
+
+      - name: Install Android SDK & NDK
+        run: |
+          SDK_DIR=${{ github.workspace }}/android-sdk
+          NDK_DIR=${{ github.workspace }}/android-ndk
+
+          SDK_URL="https://dl.google.com/android/repository/commandlinetools-mac-10406996_latest.zip"
+          NDK_URL="https://dl.google.com/android/repository/android-ndk-r26c-darwin.zip"
+
+          mkdir -p "$SDK_DIR/cmdline-tools"
+          curl -L "$SDK_URL" -o sdk.zip
+          unzip -q sdk.zip -d "$SDK_DIR/cmdline-tools"
+          mv "$SDK_DIR/cmdline-tools/cmdline-tools" "$SDK_DIR/cmdline-tools/latest"
+          rm sdk.zip
+
+          mkdir -p "$NDK_DIR"
+          curl -L "$NDK_URL" -o ndk.zip
+          unzip -q ndk.zip -d "$NDK_DIR"
+          rm ndk.zip
+
+          echo "ANDROID_SDK_ROOT=$SDK_DIR" >> $GITHUB_ENV
+          echo "ANDROID_HOME=$SDK_DIR" >> $GITHUB_ENV
+          echo "ANDROID_NDK_ROOT=$NDK_DIR" >> $GITHUB_ENV
+          echo "ANDROID_NDK_HOME=$NDK_DIR" >> $GITHUB_ENV
+          echo "$NDK_DIR/toolchains/llvm/prebuilt/darwin-x86_64/bin" >> $GITHUB_PATH
+
+      - name: Force Clang toolchain
+        run: |
+          echo "CC=aarch64-linux-android34-clang" >> $GITHUB_ENV
+          echo "CXX=aarch64-linux-android34-clang++" >> $GITHUB_ENV
+          echo "AR=llvm-ar" >> $GITHUB_ENV
+          echo "LD=ld.lld" >> $GITHUB_ENV
+          echo "STRIP=llvm-strip" >> $GITHUB_ENV
+          echo "RANLIB=llvm-ranlib" >> $GITHUB_ENV
+
+      - name: Install prebuilt compression libraries (bz2, lzma)
+        run: |
+          SYSROOT=${{ github.workspace }}/android-libs/aarch64-linux-android
+          mkdir -p $SYSROOT
+          curl -L https://github.com/Aasyaco/Some-help/releases/download/compression_libs/compression-libs-aarch64-android.tar.gz -o compression-libs.tar.gz
+          tar -xzf compression-libs.tar.gz -C "${{ github.workspace }}/android-libs"
+          echo "LDFLAGS=-L$SYSROOT/lib -Wl,-rpath,$SYSROOT/lib" >> $GITHUB_ENV
+          echo "CPPFLAGS=-I$SYSROOT/include" >> $GITHUB_ENV
+          echo "LIBRARY_PATH=$SYSROOT/lib" >> $GITHUB_ENV
+          echo "LD_LIBRARY_PATH=$SYSROOT/lib" >> $GITHUB_ENV
+
+      - name: Build CPython using android.py
+        working-directory: cpython-3.13/Android
+        run: |
+          ./android.py clean
+          mkdir -p cross-build/build
+          ./android.py ci aarch64-linux-android \
+            -- \
+            --with-ensurepip=yes \
+            --enable-optimizations \
+            --with-lto \
+            --with-computed-gotos \
+            --with-build-python=/usr/bin/python3 \
+            --build=arm64-apple-darwin \
+            --host=aarch64-linux-android
+
+      - name: Package as DEB
+        run: |
+          BUILD_DIR=cpython-3.13/Android/cross-build/aarch64-linux-android
+          OUT_DIR=$( [ -d "$BUILD_DIR/prefix" ] && echo "$BUILD_DIR/prefix" || echo "$BUILD_DIR/install" )
+          mkdir -p $DEB_DIR/DEBIAN
+          mkdir -p $DEB_DIR/usr
+          cp -r $OUT_DIR/* $DEB_DIR/usr/
+
+          cat > $DEB_DIR/DEBIAN/control <<EOF
+          Package: $PKG_NAME
+          Version: $PKG_VERSION
+          Architecture: $ARCH
+          Maintainer: Cross-compiled by GitHub Actions
+          Description: Python $PKG_VERSION cross-compiled for Termux aarch64
+          Built with Clang from Android NDK and optimized (LTO, computed gotos, ensurepip)
+          EOF
+
+          cat > $DEB_DIR/DEBIAN/postinst <<'EOF'
+          #!/bin/sh
+          echo "$PKG_NAME installed successfully!"
+          exit 0
+          EOF
+          chmod 755 $DEB_DIR/DEBIAN/postinst
+
+          dpkg-deb --build $DEB_DIR ${PKG_NAME}_${PKG_VERSION}_${ARCH}.deb
+
+      - name: Upload Debian package
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-${{ env.PKG_VERSION }}-${{ env.ARCH }}
+          path: python_${{ env.PKG_VERSION }}_${{ env.ARCH }}.deb
