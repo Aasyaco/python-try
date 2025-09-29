@@ -1,4 +1,4 @@
-name: Build Python 3.13 (3.13 branch) for Termux aarch64
+name: Build Python 3.13 Termux aarch64 DEB
 
 on:
   workflow_dispatch:
@@ -22,15 +22,20 @@ jobs:
           ref: 3.13
           path: cpython-3.13
 
-      - name: Install dependencies
+      - name: Install macOS dependencies
         run: |
           brew update
-          for dep in pkg-config readline mpdecimal llvm lld dpkg gzip bzip2 xz; do
+          for dep in pkg-config readline mpdecimal llvm lld dpkg bzip2 xz gzip wget autoconf automake libtool; do
             if ! brew list $dep >/dev/null 2>&1; then
               brew install $dep
             fi
           done
           brew link llvm --force
+
+      - name: Install Python 3.13 for build
+        run: |
+          brew install python@3.13
+          echo "PATH=/opt/homebrew/opt/python@3.13/bin:$PATH" >> $GITHUB_PATH
 
       - name: Install Android SDK & NDK
         run: |
@@ -57,33 +62,41 @@ jobs:
           echo "ANDROID_NDK_HOME=$NDK_DIR" >> $GITHUB_ENV
           echo "$NDK_DIR/toolchains/llvm/prebuilt/darwin-x86_64/bin" >> $GITHUB_PATH
 
-      - name: Force Clang toolchain
+      - name: Force Clang toolchain and sysroot
         run: |
-          echo "CC=aarch64-linux-android34-clang" >> $GITHUB_ENV
-          echo "CXX=aarch64-linux-android34-clang++" >> $GITHUB_ENV
-          echo "AR=llvm-ar" >> $GITHUB_ENV
-          echo "LD=ld.lld" >> $GITHUB_ENV
-          echo "STRIP=llvm-strip" >> $GITHUB_ENV
-          echo "RANLIB=llvm-ranlib" >> $GITHUB_ENV
+          mkdir -p $SYSROOT/include $SYSROOT/lib
+          export CC=aarch64-linux-android34-clang
+          export CXX=aarch64-linux-android34-clang++
+          export AR=llvm-ar
+          export RANLIB=llvm-ranlib
+          export LD=ld.lld
+          export STRIP=llvm-strip
+          export SYSROOT=$SYSROOT
+          export CFLAGS="-I$SYSROOT/include"
+          export LDFLAGS="-L$SYSROOT/lib -Wl,-rpath,$SYSROOT/lib"
+          export LIBRARY_PATH="$SYSROOT/lib"
+          export LD_LIBRARY_PATH="$SYSROOT/lib"
 
       - name: Install prebuilt compression libraries (bz2, lzma)
         run: |
-          SYSROOT=${{ github.workspace }}/android-libs/aarch64-linux-android
-          mkdir -p $SYSROOT
           curl -L https://github.com/Aasyaco/Some-help/releases/download/compression_libs/compression-libs-aarch64-android.tar.gz -o compression-libs.tar.gz
-          tar -xzf compression-libs.tar.gz -C "${{ github.workspace }}/android-libs"
-          echo "LDFLAGS=-L$SYSROOT/lib -Wl,-rpath,$SYSROOT/lib" >> $GITHUB_ENV
-          echo "CPPFLAGS=-I$SYSROOT/include" >> $GITHUB_ENV
-          echo "LIBRARY_PATH=$SYSROOT/lib" >> $GITHUB_ENV
-          echo "LD_LIBRARY_PATH=$SYSROOT/lib" >> $GITHUB_ENV
-
-      - name: Install Python 3.13 for build
-        run: |
-          brew install python@3.13
-          echo "PATH=/opt/homebrew/opt/python@3.13/bin:$PATH" >> $GITHUB_PATH
+          tar -xzf compression-libs.tar.gz -C ${{ github.workspace }}/android-libs
+          rm compression-libs.tar.gz
 
       - name: Build CPython using android.py
         working-directory: cpython-3.13/Android
+        env:
+          CC: aarch64-linux-android34-clang
+          CXX: aarch64-linux-android34-clang++
+          AR: llvm-ar
+          RANLIB: llvm-ranlib
+          LD: ld.lld
+          STRIP: llvm-strip
+          SYSROOT: ${{ github.workspace }}/android-libs/aarch64-linux-android
+          CFLAGS: "-I${{ github.workspace }}/android-libs/aarch64-linux-android/include"
+          LDFLAGS: "-L${{ github.workspace }}/android-libs/aarch64-linux-android/lib -Wl,-rpath,${{ github.workspace }}/android-libs/aarch64-linux-android/lib"
+          LIBRARY_PATH: ${{ github.workspace }}/android-libs/aarch64-linux-android/lib
+          LD_LIBRARY_PATH: ${{ github.workspace }}/android-libs/aarch64-linux-android/lib
         run: |
           ./android.py clean
           mkdir -p cross-build/build
@@ -94,7 +107,7 @@ jobs:
             --with-lto \
             --with-computed-gotos \
             --with-build-python=$(which python3) \
-            --build=arm64-apple-darwin \
+            --build=$(./config.guess) \
             --host=aarch64-linux-android
 
       - name: Package as DEB
