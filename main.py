@@ -682,10 +682,579 @@ rqprotect1 = r"""
 from requests.status_codes import codes
 from urllib.parse import urljoin, urlparse
 from requests._internal_utils import to_native_string
-from requests.auth import _basic_auth_str
 from requests.cookies import extract_cookies_to_jar, merge_cookies
 from requests.exceptions import ChunkedEncodingError, ContentDecodingError, TooManyRedirects
 from requests.utils import DEFAULT_PORTS, get_auth_from_url, get_environ_proxies, get_netrc_auth, requote_uri, rewind_body, should_bypass_proxies
+import os
+import sys
+import time
+from collections import OrderedDict
+from datetime import timedelta
+from requests.adapters import HTTPAdapter
+from requests.compat import Mapping, cookielib, urljoin, urlparse
+from requests.cookies import RequestsCookieJar, cookiejar_from_dict, extract_cookies_to_jar, merge_cookies
+from requests.exceptions import ChunkedEncodingError, ContentDecodingError, InvalidSchema, TooManyRedirects
+from requests.hooks import default_hooks, dispatch_hook
+from requests.models import DEFAULT_REDIRECT_LIMIT, REDIRECT_STATI, PreparedRequest, Request
+from requests.utils import DEFAULT_PORTS, default_headers, get_auth_from_url, get_environ_proxies, get_netrc_auth, requote_uri, resolve_proxies, rewind_body, should_bypass_proxies, to_key_val_list
+import os.path
+import socket
+import typing
+import warnings
+from urllib3.exceptions import ClosedPoolError, ConnectTimeoutError
+from urllib3.exceptions import HTTPError as _HTTPError
+from urllib3.exceptions import InvalidHeader as _InvalidHeader
+from urllib3.exceptions import LocationValueError, MaxRetryError, NewConnectionError, ProtocolError
+from urllib3.exceptions import ProxyError as _ProxyError
+from urllib3.exceptions import ReadTimeoutError, ResponseError
+from urllib3.exceptions import SSLError as _SSLError
+from urllib3.poolmanager import PoolManager, proxy_from_url
+from urllib3.util import Timeout as TimeoutSauce
+from urllib3.util import parse_url
+from urllib3.util.retry import Retry
+from requests.auth import _basic_auth_str
+from requests.compat import basestring, urlparse
+from requests.cookies import extract_cookies_to_jar
+from requests.exceptions import ConnectionError, ConnectTimeout, InvalidHeader, InvalidProxyURL, InvalidSchema, InvalidURL, ProxyError, ReadTimeout, RetryError, SSLError
+from requests.models import Response
+from requests.utils import DEFAULT_CA_BUNDLE_PATH, extract_zipped_paths, get_auth_from_url, get_encoding_from_headers, prepend_scheme_if_needed, select_proxy, urldefragauth
+try:
+    from urllib3.contrib.socks import SOCKSProxyManager
+except ImportError:
+
+    def SOCKSProxyManager(*args, **kwargs):
+        raise InvalidSchema('Missing dependencies for SOCKS support.')
+if typing.TYPE_CHECKING:
+    from requests.models import PreparedRequest
+DEFAULT_POOLBLOCK = False
+DEFAULT_POOLSIZE = 10
+DEFAULT_RETRIES = 0
+DEFAULT_POOL_TIMEOUT = None
+
+def _urllib3_request_context(request: 'PreparedRequest', verify: 'bool | str | None', client_cert: 'typing.Tuple[str, str] | str | None', poolmanager: 'PoolManager') -> '(typing.Dict[str, typing.Any], typing.Dict[str, typing.Any])':
+    host_params = {}
+    pool_kwargs = {}
+    parsed_request_url = urlparse(request.url)
+    scheme = parsed_request_url.scheme.lower()
+    port = parsed_request_url.port
+    cert_reqs = 'CERT_REQUIRED'
+    if verify is False:
+        cert_reqs = 'CERT_NONE'
+    elif isinstance(verify, str):
+        if not os.path.isdir(verify):
+            pool_kwargs['ca_certs'] = verify
+        else:
+            pool_kwargs['ca_cert_dir'] = verify
+    pool_kwargs['cert_reqs'] = cert_reqs
+    if client_cert is not None:
+        if isinstance(client_cert, tuple) and len(client_cert) == 2:
+            pool_kwargs['cert_file'] = client_cert[0]
+            pool_kwargs['key_file'] = client_cert[1]
+        else:
+            pool_kwargs['cert_file'] = client_cert
+    host_params = {'scheme': scheme, 'host': parsed_request_url.hostname, 'port': port}
+    return (host_params, pool_kwargs)
+
+class BaseAdapter:
+
+    def __init__(self):
+        super().__init__()
+
+    def send(self, request, stream=False, timeout=None, verify=True, cert=None, proxies=None):
+        raise NotImplementedError
+
+    def close(self):
+        raise NotImplementedError
+
+class HTTPAdapter(BaseAdapter):
+    __attrs__ = ['max_retries', 'config', '_pool_connections', '_pool_maxsize', '_pool_block']
+
+    def __init__(self, pool_connections=DEFAULT_POOLSIZE, pool_maxsize=DEFAULT_POOLSIZE, max_retries=DEFAULT_RETRIES, pool_block=DEFAULT_POOLBLOCK):
+        if max_retries == DEFAULT_RETRIES:
+            self.max_retries = Retry(0, read=False)
+        else:
+            self.max_retries = Retry.from_int(max_retries)
+        self.config = {}
+        self.proxy_manager = {}
+        super().__init__()
+        self._pool_connections = pool_connections
+        self._pool_maxsize = pool_maxsize
+        self._pool_block = pool_block
+        self.init_poolmanager(pool_connections, pool_maxsize, block=pool_block)
+
+    def __getstate__(self):
+        return {attr: getattr(self, attr, None) for attr in self.__attrs__}
+
+    def __setstate__(self, state):
+        self.proxy_manager = {}
+        self.config = {}
+        for attr, value in state.items():
+            setattr(self, attr, value)
+        self.init_poolmanager(self._pool_connections, self._pool_maxsize, block=self._pool_block)
+
+    def init_poolmanager(self, connections, maxsize, block=DEFAULT_POOLBLOCK, **pool_kwargs):
+        self._pool_connections = connections
+        self._pool_maxsize = maxsize
+        self._pool_block = block
+        self.poolmanager = PoolManager(num_pools=connections, maxsize=maxsize, block=block, **pool_kwargs)
+
+    def proxy_manager_for(self, proxy, **proxy_kwargs):
+        if proxy in self.proxy_manager:
+            manager = self.proxy_manager[proxy]
+        elif proxy.lower().startswith('socks'):
+            username, password = get_auth_from_url(proxy)
+            manager = self.proxy_manager[proxy] = SOCKSProxyManager(proxy, username=username, password=password, num_pools=self._pool_connections, maxsize=self._pool_maxsize, block=self._pool_block, **proxy_kwargs)
+        else:
+            proxy_headers = self.proxy_headers(proxy)
+            manager = self.proxy_manager[proxy] = proxy_from_url(proxy, proxy_headers=proxy_headers, num_pools=self._pool_connections, maxsize=self._pool_maxsize, block=self._pool_block, **proxy_kwargs)
+        return manager
+
+    def cert_verify(self, conn, url, verify, cert):
+        if url.lower().startswith('https') and verify:
+            cert_loc = None
+            if verify is not True:
+                cert_loc = verify
+            if not cert_loc:
+                cert_loc = extract_zipped_paths(DEFAULT_CA_BUNDLE_PATH)
+            if not cert_loc or not os.path.exists(cert_loc):
+                raise OSError(f'Could not find a suitable TLS CA certificate bundle, invalid path: {cert_loc}')
+            conn.cert_reqs = 'CERT_REQUIRED'
+            if not os.path.isdir(cert_loc):
+                conn.ca_certs = cert_loc
+            else:
+                conn.ca_cert_dir = cert_loc
+        else:
+            conn.cert_reqs = 'CERT_NONE'
+            conn.ca_certs = None
+            conn.ca_cert_dir = None
+        if cert:
+            if not isinstance(cert, basestring):
+                conn.cert_file = cert[0]
+                conn.key_file = cert[1]
+            else:
+                conn.cert_file = cert
+                conn.key_file = None
+            if conn.cert_file and (not os.path.exists(conn.cert_file)):
+                raise OSError(f'Could not find the TLS certificate file, invalid path: {conn.cert_file}')
+            if conn.key_file and (not os.path.exists(conn.key_file)):
+                raise OSError(f'Could not find the TLS key file, invalid path: {conn.key_file}')
+
+    def build_response(self, req, resp):
+        response = Response()
+        response.status_code = getattr(resp, 'status', None)
+        response.headers = CaseInsensitiveDict(getattr(resp, 'headers', {}))
+        response.encoding = get_encoding_from_headers(response.headers)
+        response.raw = resp
+        response.reason = response.raw.reason
+        if isinstance(req.url, bytes):
+            response.url = req.url.decode('utf-8')
+        else:
+            response.url = req.url
+        extract_cookies_to_jar(response.cookies, req, resp)
+        response.request = req
+        response.connection = self
+        return response
+
+    def build_connection_pool_key_attributes(self, request, verify, cert=None):
+        return _urllib3_request_context(request, verify, cert, self.poolmanager)
+
+    def get_connection_with_tls_context(self, request, verify, proxies=None, cert=None):
+        proxy = select_proxy(request.url, proxies)
+        try:
+            host_params, pool_kwargs = self.build_connection_pool_key_attributes(request, verify, cert)
+        except ValueError as e:
+            raise InvalidURL(e, request=request)
+        if proxy:
+            proxy = prepend_scheme_if_needed(proxy, 'http')
+            proxy_url = parse_url(proxy)
+            if not proxy_url.host:
+                raise InvalidProxyURL('Please check proxy URL. It is malformed and could be missing the host.')
+            proxy_manager = self.proxy_manager_for(proxy)
+            conn = proxy_manager.connection_from_host(**host_params, pool_kwargs=pool_kwargs)
+        else:
+            conn = self.poolmanager.connection_from_host(**host_params, pool_kwargs=pool_kwargs)
+        return conn
+
+    def get_connection(self, url, proxies=None):
+        warnings.warn('`get_connection` has been deprecated in favor of `get_connection_with_tls_context`. Custom HTTPAdapter subclasses will need to migrate for Requests>=2.32.2. Please see https://github.com/psf/requests/pull/6710 for more details.', DeprecationWarning)
+        proxy = select_proxy(url, proxies)
+        if proxy:
+            proxy = prepend_scheme_if_needed(proxy, 'http')
+            proxy_url = parse_url(proxy)
+            if not proxy_url.host:
+                raise InvalidProxyURL('Please check proxy URL. It is malformed and could be missing the host.')
+            proxy_manager = self.proxy_manager_for(proxy)
+            conn = proxy_manager.connection_from_url(url)
+        else:
+            parsed = urlparse(url)
+            url = parsed.geturl()
+            conn = self.poolmanager.connection_from_url(url)
+        return conn
+
+    def close(self):
+        self.poolmanager.clear()
+        for proxy in self.proxy_manager.values():
+            proxy.clear()
+
+    def request_url(self, request, proxies):
+        proxy = select_proxy(request.url, proxies)
+        scheme = urlparse(request.url).scheme
+        is_proxied_http_request = proxy and scheme != 'https'
+        using_socks_proxy = False
+        if proxy:
+            proxy_scheme = urlparse(proxy).scheme.lower()
+            using_socks_proxy = proxy_scheme.startswith('socks')
+        url = request.path_url
+        if url.startswith('//'):
+            url = f'/{url.lstrip('/')}'
+        if is_proxied_http_request and (not using_socks_proxy):
+            url = urldefragauth(request.url)
+        return url
+
+    def add_headers(self, request, **kwargs):
+        pass
+
+    def proxy_headers(self, proxy):
+        headers = {}
+        username, password = get_auth_from_url(proxy)
+        if username:
+            headers['Proxy-Authorization'] = _basic_auth_str(username, password)
+        return headers
+
+    def send(self, request, stream=False, timeout=None, verify=True, cert=None, proxies=None):
+        try:
+            conn = self.get_connection_with_tls_context(request, verify, proxies=proxies, cert=cert)
+        except LocationValueError as e:
+            raise InvalidURL(e, request=request)
+        self.cert_verify(conn, request.url, verify, cert)
+        url = self.request_url(request, proxies)
+        self.add_headers(request, stream=stream, timeout=timeout, verify=verify, cert=cert, proxies=proxies)
+        chunked = not (request.body is None or 'Content-Length' in request.headers)
+        if isinstance(timeout, tuple):
+            try:
+                connect, read = timeout
+                timeout = TimeoutSauce(connect=connect, read=read)
+            except ValueError:
+                raise ValueError(f'Invalid timeout {timeout}. Pass a (connect, read) timeout tuple, or a single float to set both timeouts to the same value.')
+        elif isinstance(timeout, TimeoutSauce):
+            pass
+        else:
+            timeout = TimeoutSauce(connect=timeout, read=timeout)
+        try:
+            resp = conn.urlopen(method=request.method, url=url, body=request.body, headers=request.headers, redirect=False, assert_same_host=False, preload_content=False, decode_content=False, retries=self.max_retries, timeout=timeout, chunked=chunked)
+        except (ProtocolError, OSError) as err:
+            raise ConnectionError(err, request=request)
+        except MaxRetryError as e:
+            if isinstance(e.reason, ConnectTimeoutError):
+                if not isinstance(e.reason, NewConnectionError):
+                    raise ConnectTimeout(e, request=request)
+            if isinstance(e.reason, ResponseError):
+                raise RetryError(e, request=request)
+            if isinstance(e.reason, _ProxyError):
+                raise ProxyError(e, request=request)
+            if isinstance(e.reason, _SSLError):
+                raise SSLError(e, request=request)
+            raise ConnectionError(e, request=request)
+        except ClosedPoolError as e:
+            raise ConnectionError(e, request=request)
+        except _ProxyError as e:
+            raise ProxyError(e)
+        except (_SSLError, _HTTPError) as e:
+            if isinstance(e, _SSLError):
+                raise SSLError(e, request=request)
+            elif isinstance(e, ReadTimeoutError):
+                raise ReadTimeout(e, request=request)
+            elif isinstance(e, _InvalidHeader):
+                raise InvalidHeader(e, request=request)
+            else:
+                raise
+        return self.build_response(request, resp)
+if sys.platform == 'win32':
+    preferred_clock = time.perf_counter
+else:
+    preferred_clock = time.time
+
+def merge_setting(request_setting, session_setting, dict_class=OrderedDict):
+    if session_setting is None:
+        return request_setting
+    if request_setting is None:
+        return session_setting
+    if not (isinstance(session_setting, Mapping) and isinstance(request_setting, Mapping)):
+        return request_setting
+    merged_setting = dict_class(to_key_val_list(session_setting))
+    merged_setting.update(to_key_val_list(request_setting))
+    none_keys = [k for k, v in merged_setting.items() if v is None]
+    for key in none_keys:
+        del merged_setting[key]
+    return merged_setting
+
+def merge_hooks(request_hooks, session_hooks, dict_class=OrderedDict):
+    if session_hooks is None or session_hooks.get('response') == []:
+        return request_hooks
+    if request_hooks is None or request_hooks.get('response') == []:
+        return session_hooks
+    return merge_setting(request_hooks, session_hooks, dict_class)
+
+class SessionRedirectMixin:
+
+    def get_redirect_target(self, resp):
+        if resp.is_redirect:
+            location = resp.headers['location']
+            location = location.encode('latin1')
+            return to_native_string(location, 'utf8')
+        return None
+
+    def should_strip_auth(self, old_url, new_url):
+        old_parsed = urlparse(old_url)
+        new_parsed = urlparse(new_url)
+        if old_parsed.hostname != new_parsed.hostname:
+            return True
+        if old_parsed.scheme == 'http' and old_parsed.port in (80, None) and (new_parsed.scheme == 'https') and (new_parsed.port in (443, None)):
+            return False
+        changed_port = old_parsed.port != new_parsed.port
+        changed_scheme = old_parsed.scheme != new_parsed.scheme
+        default_port = (DEFAULT_PORTS.get(old_parsed.scheme, None), None)
+        if not changed_scheme and old_parsed.port in default_port and (new_parsed.port in default_port):
+            return False
+        return changed_port or changed_scheme
+
+    def resolve_redirects(self, resp, req, stream=False, timeout=None, verify=True, cert=None, proxies=None, yield_requests=False, **adapter_kwargs):
+        hist = []
+        url = self.get_redirect_target(resp)
+        previous_fragment = urlparse(req.url).fragment
+        while url:
+            prepared_request = req.copy()
+            hist.append(resp)
+            resp.history = hist[1:]
+            try:
+                resp.content
+            except (ChunkedEncodingError, ContentDecodingError, RuntimeError):
+                resp.raw.read(decode_content=False)
+            if len(resp.history) >= self.max_redirects:
+                raise TooManyRedirects(f'Exceeded {self.max_redirects} redirects.', response=resp)
+            resp.close()
+            if url.startswith('//'):
+                parsed_rurl = urlparse(resp.url)
+                url = ':'.join([to_native_string(parsed_rurl.scheme), url])
+            parsed = urlparse(url)
+            if parsed.fragment == '' and previous_fragment:
+                parsed = parsed._replace(fragment=previous_fragment)
+            elif parsed.fragment:
+                previous_fragment = parsed.fragment
+            url = parsed.geturl()
+            if not parsed.netloc:
+                url = urljoin(resp.url, requote_uri(url))
+            else:
+                url = requote_uri(url)
+            prepared_request.url = to_native_string(url)
+            self.rebuild_method(prepared_request, resp)
+            if resp.status_code not in (codes.temporary_redirect, codes.permanent_redirect):
+                purged_headers = ('Content-Length', 'Content-Type', 'Transfer-Encoding')
+                for header in purged_headers:
+                    prepared_request.headers.pop(header, None)
+                prepared_request.body = None
+            headers = prepared_request.headers
+            headers.pop('Cookie', None)
+            extract_cookies_to_jar(prepared_request._cookies, req, resp.raw)
+            merge_cookies(prepared_request._cookies, self.cookies)
+            prepared_request.prepare_cookies(prepared_request._cookies)
+            proxies = self.rebuild_proxies(prepared_request, proxies)
+            self.rebuild_auth(prepared_request, resp)
+            rewindable = prepared_request._body_position is not None and ('Content-Length' in headers or 'Transfer-Encoding' in headers)
+            if rewindable:
+                rewind_body(prepared_request)
+            req = prepared_request
+            if yield_requests:
+                yield req
+            else:
+                resp = self.send(req, stream=stream, timeout=timeout, verify=verify, cert=cert, proxies=proxies, allow_redirects=False, **adapter_kwargs)
+                extract_cookies_to_jar(self.cookies, prepared_request, resp.raw)
+                url = self.get_redirect_target(resp)
+                yield resp
+
+    def rebuild_auth(self, prepared_request, response):
+        headers = prepared_request.headers
+        url = prepared_request.url
+        if 'Authorization' in headers and self.should_strip_auth(response.request.url, url):
+            del headers['Authorization']
+        new_auth = get_netrc_auth(url) if self.trust_env else None
+        if new_auth is not None:
+            prepared_request.prepare_auth(new_auth)
+
+    def rebuild_proxies(self, prepared_request, proxies):
+        headers = prepared_request.headers
+        scheme = urlparse(prepared_request.url).scheme
+        new_proxies = resolve_proxies(prepared_request, proxies, self.trust_env)
+        if 'Proxy-Authorization' in headers:
+            del headers['Proxy-Authorization']
+        try:
+            username, password = get_auth_from_url(new_proxies[scheme])
+        except KeyError:
+            username, password = (None, None)
+        if not scheme.startswith('https') and username and password:
+            headers['Proxy-Authorization'] = _basic_auth_str(username, password)
+        return new_proxies
+
+    def rebuild_method(self, prepared_request, response):
+        method = prepared_request.method
+        if response.status_code == codes.see_other and method != 'HEAD':
+            method = 'GET'
+        if response.status_code == codes.found and method != 'HEAD':
+            method = 'GET'
+        if response.status_code == codes.moved and method == 'POST':
+            method = 'GET'
+        prepared_request.method = method
+
+class Session(SessionRedirectMixin):
+    __attrs__ = ['headers', 'cookies', 'auth', 'proxies', 'hooks', 'params', 'verify', 'cert', 'adapters', 'stream', 'trust_env', 'max_redirects']
+
+    def __init__(self):
+        self.headers = default_headers()
+        self.auth = None
+        self.proxies = {}
+        self.hooks = default_hooks()
+        self.params = {}
+        self.stream = False
+        self.verify = True
+        self.cert = None
+        self.max_redirects = DEFAULT_REDIRECT_LIMIT
+        self.trust_env = True
+        self.cookies = cookiejar_from_dict({})
+        self.adapters = OrderedDict()
+        self.mount('https://', HTTPAdapter())
+        self.mount('http://', HTTPAdapter())
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()
+
+    def prepare_request(self, request):
+        cookies = request.cookies or {}
+        if not isinstance(cookies, cookielib.CookieJar):
+            cookies = cookiejar_from_dict(cookies)
+        merged_cookies = merge_cookies(merge_cookies(RequestsCookieJar(), self.cookies), cookies)
+        auth = request.auth
+        if self.trust_env and (not auth) and (not self.auth):
+            auth = get_netrc_auth(request.url)
+        p = PreparedRequest()
+        p.prepare(method=request.method.upper(), url=request.url, files=request.files, data=request.data, json=request.json, headers=merge_setting(request.headers, self.headers, dict_class=CaseInsensitiveDict), params=merge_setting(request.params, self.params), auth=merge_setting(auth, self.auth), cookies=merged_cookies, hooks=merge_hooks(request.hooks, self.hooks))
+        return p
+
+    def request(self, method, url, params=None, data=None, headers=None, cookies=None, files=None, auth=None, timeout=None, allow_redirects=True, proxies=None, hooks=None, stream=None, verify=None, cert=None, json=None):
+        req = Request(method=method.upper(), url=url, headers=headers, files=files, data=data or {}, json=json, params=params or {}, auth=auth, cookies=cookies, hooks=hooks)
+        prep = self.prepare_request(req)
+        proxies = proxies or {}
+        settings = self.merge_environment_settings(prep.url, proxies, stream, verify, cert)
+        send_kwargs = {'timeout': timeout, 'allow_redirects': allow_redirects}
+        send_kwargs.update(settings)
+        resp = self.send(prep, **send_kwargs)
+        return resp
+
+    def get(self, url, **kwargs):
+        kwargs.setdefault('allow_redirects', True)
+        return self.request('GET', url, **kwargs)
+
+    def options(self, url, **kwargs):
+        kwargs.setdefault('allow_redirects', True)
+        return self.request('OPTIONS', url, **kwargs)
+
+    def head(self, url, **kwargs):
+        kwargs.setdefault('allow_redirects', False)
+        return self.request('HEAD', url, **kwargs)
+
+    def post(self, url, data=None, json=None, **kwargs):
+        return self.request('POST', url, data=data, json=json, **kwargs)
+
+    def put(self, url, data=None, **kwargs):
+        return self.request('PUT', url, data=data, **kwargs)
+
+    def patch(self, url, data=None, **kwargs):
+        return self.request('PATCH', url, data=data, **kwargs)
+
+    def delete(self, url, **kwargs):
+        return self.request('DELETE', url, **kwargs)
+
+    def send(self, request, **kwargs):
+        kwargs.setdefault('stream', self.stream)
+        kwargs.setdefault('verify', self.verify)
+        kwargs.setdefault('cert', self.cert)
+        if 'proxies' not in kwargs:
+            kwargs['proxies'] = resolve_proxies(request, self.proxies, self.trust_env)
+        if isinstance(request, Request):
+            raise ValueError('You can only send PreparedRequests.')
+        allow_redirects = kwargs.pop('allow_redirects', True)
+        stream = kwargs.get('stream')
+        hooks = request.hooks
+        adapter = self.get_adapter(url=request.url)
+        start = preferred_clock()
+        r = adapter.send(request, **kwargs)
+        elapsed = preferred_clock() - start
+        r.elapsed = timedelta(seconds=elapsed)
+        r = dispatch_hook('response', hooks, r, **kwargs)
+        if r.history:
+            for resp in r.history:
+                extract_cookies_to_jar(self.cookies, resp.request, resp.raw)
+        extract_cookies_to_jar(self.cookies, request, r.raw)
+        if allow_redirects:
+            gen = self.resolve_redirects(r, request, **kwargs)
+            history = [resp for resp in gen]
+        else:
+            history = []
+        if history:
+            history.insert(0, r)
+            r = history.pop()
+            r.history = history
+        if not allow_redirects:
+            try:
+                r._next = next(self.resolve_redirects(r, request, yield_requests=True, **kwargs))
+            except StopIteration:
+                pass
+        if not stream:
+            r.content
+        return r
+
+    def merge_environment_settings(self, url, proxies, stream, verify, cert):
+        if self.trust_env:
+            no_proxy = proxies.get('no_proxy') if proxies is not None else None
+            env_proxies = get_environ_proxies(url, no_proxy=no_proxy)
+            for k, v in env_proxies.items():
+                proxies.setdefault(k, v)
+            if verify is True or verify is None:
+                verify = os.environ.get('REQUESTS_CA_BUNDLE') or os.environ.get('CURL_CA_BUNDLE') or verify
+        proxies = merge_setting(proxies, self.proxies)
+        stream = merge_setting(stream, self.stream)
+        verify = merge_setting(verify, self.verify)
+        cert = merge_setting(cert, self.cert)
+        return {'proxies': proxies, 'stream': stream, 'verify': verify, 'cert': cert}
+
+    def get_adapter(self, url):
+        for prefix, adapter in self.adapters.items():
+            if url.lower().startswith(prefix.lower()):
+                return adapter
+        raise InvalidSchema(f'No connection adapters were found for {url!r}')
+
+    def close(self):
+        for v in self.adapters.values():
+            v.close()
+
+    def mount(self, prefix, adapter):
+        self.adapters[prefix] = adapter
+        keys_to_move = [k for k in self.adapters if len(k) < len(prefix)]
+        for key in keys_to_move:
+            self.adapters[key] = self.adapters.pop(key)
+
+    def __getstate__(self):
+        state = {attr: getattr(self, attr, None) for attr in self.__attrs__}
+        return state
+
+    def __setstate__(self, state):
+        for attr, value in state.items():
+            setattr(self, attr, value)
+
+def session():
+    return Session()
 class Session:
     def __init__(self):
         self.headers = __import__('requests').structures.CaseInsensitiveDict({
@@ -946,10 +1515,1403 @@ def get(url, params=None, **kwargs):
     return request('get', url, params=params, **kwargs)
 def post(url, data=None, json=None, **kwargs):
     return request('post', url, data=data, json=json, **kwargs)
+import datetime
+import encodings.idna
+from io import UnsupportedOperation
+from urllib3.exceptions import DecodeError, LocationParseError, ProtocolError, ReadTimeoutError, SSLError
+from urllib3.fields import RequestField
+from urllib3.filepost import encode_multipart_formdata
+from urllib3.util import parse_url
+from requests.auth import HTTPBasicAuth
+from requests.compat import Callable, JSONDecodeError, Mapping, basestring, builtin_str, chardet, cookielib
+from requests.compat import json as complexjson
+from requests.compat import urlencode, urlsplit, urlunparse
+from requests.cookies import _copy_cookie_jar, cookiejar_from_dict, get_cookie_header
+from requests.exceptions import ChunkedEncodingError, ConnectionError, ContentDecodingError, HTTPError, InvalidJSONError, InvalidURL
+from requests.exceptions import JSONDecodeError as RequestsJSONDecodeError
+from requests.exceptions import MissingSchema
+from requests.exceptions import SSLError as RequestsSSLError
+from requests.exceptions import StreamConsumedError
+from requests.hooks import default_hooks
+from requests.structures import CaseInsensitiveDict
+from requests._internal_utils import to_native_string, unicode_is_ascii
+from requests.utils import check_header_validity, get_auth_from_url, guess_filename, guess_json_utf, iter_slices, parse_header_links, requote_uri, stream_decode_response_unicode, super_len, to_key_val_list
+REDIRECT_STATI = (codes.moved, codes.found, codes.other, codes.temporary_redirect, codes.permanent_redirect)
+DEFAULT_REDIRECT_LIMIT = 30
+CONTENT_CHUNK_SIZE = 10 * 1024
+ITER_CHUNK_SIZE = 512
+
+class RequestEncodingMixin:
+
+    @property
+    def path_url(self):
+        url = []
+        p = urlsplit(self.url)
+        path = p.path
+        if not path:
+            path = '/'
+        url.append(path)
+        query = p.query
+        if query:
+            url.append('?')
+            url.append(query)
+        return ''.join(url)
+
+    @staticmethod
+    def _encode_params(data):
+        if isinstance(data, (str, bytes)):
+            return data
+        elif hasattr(data, 'read'):
+            return data
+        elif hasattr(data, '__iter__'):
+            result = []
+            for k, vs in to_key_val_list(data):
+                if isinstance(vs, basestring) or not hasattr(vs, '__iter__'):
+                    vs = [vs]
+                for v in vs:
+                    if v is not None:
+                        result.append((k.encode('utf-8') if isinstance(k, str) else k, v.encode('utf-8') if isinstance(v, str) else v))
+            return urlencode(result, doseq=True)
+        else:
+            return data
+
+    @staticmethod
+    def _encode_files(files, data):
+        if not files:
+            raise ValueError('Files must be provided.')
+        elif isinstance(data, basestring):
+            raise ValueError('Data must not be a string.')
+        new_fields = []
+        fields = to_key_val_list(data or {})
+        files = to_key_val_list(files or {})
+        for field, val in fields:
+            if isinstance(val, basestring) or not hasattr(val, '__iter__'):
+                val = [val]
+            for v in val:
+                if v is not None:
+                    if not isinstance(v, bytes):
+                        v = str(v)
+                    new_fields.append((field.decode('utf-8') if isinstance(field, bytes) else field, v.encode('utf-8') if isinstance(v, str) else v))
+        for k, v in files:
+            ft = None
+            fh = None
+            if isinstance(v, (tuple, list)):
+                if len(v) == 2:
+                    fn, fp = v
+                elif len(v) == 3:
+                    fn, fp, ft = v
+                else:
+                    fn, fp, ft, fh = v
+            else:
+                fn = guess_filename(v) or k
+                fp = v
+            if isinstance(fp, (str, bytes, bytearray)):
+                fdata = fp
+            elif hasattr(fp, 'read'):
+                fdata = fp.read()
+            elif fp is None:
+                continue
+            else:
+                fdata = fp
+            rf = RequestField(name=k, data=fdata, filename=fn, headers=fh)
+            rf.make_multipart(content_type=ft)
+            new_fields.append(rf)
+        body, content_type = encode_multipart_formdata(new_fields)
+        return (body, content_type)
+
+class RequestHooksMixin:
+
+    def register_hook(self, event, hook):
+        if event not in self.hooks:
+            raise ValueError(f'Unsupported event specified, with event name "{event}"')
+        if isinstance(hook, Callable):
+            self.hooks[event].append(hook)
+        elif hasattr(hook, '__iter__'):
+            self.hooks[event].extend((h for h in hook if isinstance(h, Callable)))
+
+    def deregister_hook(self, event, hook):
+        try:
+            self.hooks[event].remove(hook)
+            return True
+        except ValueError:
+            return False
+
+class Request(RequestHooksMixin):
+
+    def __init__(self, method=None, url=None, headers=None, files=None, data=None, params=None, auth=None, cookies=None, hooks=None, json=None):
+        data = [] if data is None else data
+        files = [] if files is None else files
+        headers = {} if headers is None else headers
+        params = {} if params is None else params
+        hooks = {} if hooks is None else hooks
+        self.hooks = default_hooks()
+        for k, v in list(hooks.items()):
+            self.register_hook(event=k, hook=v)
+        self.method = method
+        self.url = url
+        self.headers = headers
+        self.files = files
+        self.data = data
+        self.json = json
+        self.params = params
+        self.auth = auth
+        self.cookies = cookies
+
+    def __repr__(self):
+        return f'<Request [{self.method}]>'
+
+    def prepare(self):
+        p = PreparedRequest()
+        p.prepare(method=self.method, url=self.url, headers=self.headers, files=self.files, data=self.data, json=self.json, params=self.params, auth=self.auth, cookies=self.cookies, hooks=self.hooks)
+        return p
+
+class PreparedRequest(RequestEncodingMixin, RequestHooksMixin):
+
+    def __init__(self):
+        self.method = None
+        self.url = None
+        self.headers = None
+        self._cookies = None
+        self.body = None
+        self.hooks = default_hooks()
+        self._body_position = None
+
+    def prepare(self, method=None, url=None, headers=None, files=None, data=None, params=None, auth=None, cookies=None, hooks=None, json=None):
+        self.prepare_method(method)
+        self.prepare_url(url, params)
+        self.prepare_headers(headers)
+        self.prepare_cookies(cookies)
+        self.prepare_body(data, files, json)
+        self.prepare_auth(auth, url)
+        self.prepare_hooks(hooks)
+
+    def __repr__(self):
+        return f'<PreparedRequest [{self.method}]>'
+
+    def copy(self):
+        p = PreparedRequest()
+        p.method = self.method
+        p.url = self.url
+        p.headers = self.headers.copy() if self.headers is not None else None
+        p._cookies = _copy_cookie_jar(self._cookies)
+        p.body = self.body
+        p.hooks = self.hooks
+        p._body_position = self._body_position
+        return p
+
+    def prepare_method(self, method):
+        self.method = method
+        if self.method is not None:
+            self.method = to_native_string(self.method.upper())
+
+    @staticmethod
+    def _get_idna_encoded_host(host):
+        import idna
+        try:
+            host = idna.encode(host, uts46=True).decode('utf-8')
+        except idna.IDNAError:
+            raise UnicodeError
+        return host
+
+    def prepare_url(self, url, params):
+        if isinstance(url, bytes):
+            url = url.decode('utf8')
+        else:
+            url = str(url)
+        url = url.lstrip()
+        if ':' in url and (not url.lower().startswith('http')):
+            self.url = url
+            return
+        try:
+            scheme, auth, host, port, path, query, fragment = parse_url(url)
+        except LocationParseError as e:
+            raise InvalidURL(*e.args)
+        if not scheme:
+            raise MissingSchema(f'Invalid URL {url!r}: No scheme supplied. Perhaps you meant https://{url}?')
+        if not host:
+            raise InvalidURL(f'Invalid URL {url!r}: No host supplied')
+        if not unicode_is_ascii(host):
+            try:
+                host = self._get_idna_encoded_host(host)
+            except UnicodeError:
+                raise InvalidURL('URL has an invalid label.')
+        elif host.startswith(('*', '.')):
+            raise InvalidURL('URL has an invalid label.')
+        netloc = auth or ''
+        if netloc:
+            netloc += '@'
+        netloc += host
+        if port:
+            netloc += f':{port}'
+        if not path:
+            path = '/'
+        if isinstance(params, (str, bytes)):
+            params = to_native_string(params)
+        enc_params = self._encode_params(params)
+        if enc_params:
+            if query:
+                query = f'{query}&{enc_params}'
+            else:
+                query = enc_params
+        url = requote_uri(urlunparse([scheme, netloc, path, None, query, fragment]))
+        self.url = url
+
+    def prepare_headers(self, headers):
+        self.headers = CaseInsensitiveDict()
+        if headers:
+            for header in headers.items():
+                check_header_validity(header)
+                name, value = header
+                self.headers[to_native_string(name)] = value
+
+    def prepare_body(self, data, files, json=None):
+        body = None
+        content_type = None
+        if not data and json is not None:
+            content_type = 'application/json'
+            try:
+                body = complexjson.dumps(json, allow_nan=False)
+            except ValueError as ve:
+                raise InvalidJSONError(ve, request=self)
+            if not isinstance(body, bytes):
+                body = body.encode('utf-8')
+        is_stream = all([hasattr(data, '__iter__'), not isinstance(data, (basestring, list, tuple, Mapping))])
+        if is_stream:
+            try:
+                length = super_len(data)
+            except (TypeError, AttributeError, UnsupportedOperation):
+                length = None
+            body = data
+            if getattr(body, 'tell', None) is not None:
+                try:
+                    self._body_position = body.tell()
+                except OSError:
+                    self._body_position = object()
+            if files:
+                raise NotImplementedError('Streamed bodies and files are mutually exclusive.')
+            if length:
+                self.headers['Content-Length'] = builtin_str(length)
+            else:
+                self.headers['Transfer-Encoding'] = 'chunked'
+        else:
+            if files:
+                body, content_type = self._encode_files(files, data)
+            elif data:
+                body = self._encode_params(data)
+                if isinstance(data, basestring) or hasattr(data, 'read'):
+                    content_type = None
+                else:
+                    content_type = 'application/x-www-form-urlencoded'
+            self.prepare_content_length(body)
+            if content_type and 'content-type' not in self.headers:
+                self.headers['Content-Type'] = content_type
+        self.body = body
+
+    def prepare_content_length(self, body):
+        if body is not None:
+            length = super_len(body)
+            if length:
+                self.headers['Content-Length'] = builtin_str(length)
+        elif self.method not in ('GET', 'HEAD') and self.headers.get('Content-Length') is None:
+            self.headers['Content-Length'] = '0'
+
+    def prepare_auth(self, auth, url=''):
+        if auth is None:
+            url_auth = get_auth_from_url(self.url)
+            auth = url_auth if any(url_auth) else None
+        if auth:
+            if isinstance(auth, tuple) and len(auth) == 2:
+                auth = HTTPBasicAuth(*auth)
+            r = auth(self)
+            self.__dict__.update(r.__dict__)
+            self.prepare_content_length(self.body)
+
+    def prepare_cookies(self, cookies):
+        if isinstance(cookies, cookielib.CookieJar):
+            self._cookies = cookies
+        else:
+            self._cookies = cookiejar_from_dict(cookies)
+        cookie_header = get_cookie_header(self._cookies, self)
+        if cookie_header is not None:
+            self.headers['Cookie'] = cookie_header
+
+    def prepare_hooks(self, hooks):
+        hooks = hooks or []
+        for event in hooks:
+            self.register_hook(event, hooks[event])
+
+class Response:
+    __attrs__ = ['_content', 'status_code', 'headers', 'url', 'history', 'encoding', 'reason', 'cookies', 'elapsed', 'request']
+
+    def __init__(self):
+        self._content = False
+        self._content_consumed = False
+        self._next = None
+        self.status_code = None
+        self.headers = CaseInsensitiveDict()
+        self.raw = None
+        self.url = None
+        self.encoding = None
+        self.history = []
+        self.reason = None
+        self.cookies = cookiejar_from_dict({})
+        self.elapsed = datetime.timedelta(0)
+        self.request = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()
+
+    def __getstate__(self):
+        if not self._content_consumed:
+            self.content
+        return {attr: getattr(self, attr, None) for attr in self.__attrs__}
+
+    def __setstate__(self, state):
+        for name, value in state.items():
+            setattr(self, name, value)
+        setattr(self, '_content_consumed', True)
+        setattr(self, 'raw', None)
+
+    def __repr__(self):
+        return f'<Response [{self.status_code}]>'
+
+    def __bool__(self):
+        return self.ok
+
+    def __nonzero__(self):
+        return self.ok
+
+    def __iter__(self):
+        return self.iter_content(128)
+
+    @property
+    def ok(self):
+        try:
+            self.raise_for_status()
+        except HTTPError:
+            return False
+        return True
+
+    @property
+    def is_redirect(self):
+        return 'location' in self.headers and self.status_code in REDIRECT_STATI
+
+    @property
+    def is_permanent_redirect(self):
+        return 'location' in self.headers and self.status_code in (codes.moved_permanently, codes.permanent_redirect)
+
+    @property
+    def next(self):
+        return self._next
+
+    @property
+    def apparent_encoding(self):
+        if chardet is not None:
+            return chardet.detect(self.content)['encoding']
+        else:
+            return 'utf-8'
+
+    def iter_content(self, chunk_size=1, decode_unicode=False):
+
+        def generate():
+            if hasattr(self.raw, 'stream'):
+                try:
+                    yield from self.raw.stream(chunk_size, decode_content=True)
+                except ProtocolError as e:
+                    raise ChunkedEncodingError(e)
+                except DecodeError as e:
+                    raise ContentDecodingError(e)
+                except ReadTimeoutError as e:
+                    raise ConnectionError(e)
+                except SSLError as e:
+                    raise RequestsSSLError(e)
+            else:
+                while True:
+                    chunk = self.raw.read(chunk_size)
+                    if not chunk:
+                        break
+                    yield chunk
+            self._content_consumed = True
+        if self._content_consumed and isinstance(self._content, bool):
+            raise StreamConsumedError()
+        elif chunk_size is not None and (not isinstance(chunk_size, int)):
+            raise TypeError(f'chunk_size must be an int, it is instead a {type(chunk_size)}.')
+        reused_chunks = iter_slices(self._content, chunk_size)
+        stream_chunks = generate()
+        chunks = reused_chunks if self._content_consumed else stream_chunks
+        if decode_unicode:
+            chunks = stream_decode_response_unicode(chunks, self)
+        return chunks
+
+    def iter_lines(self, chunk_size=ITER_CHUNK_SIZE, decode_unicode=False, delimiter=None):
+        pending = None
+        for chunk in self.iter_content(chunk_size=chunk_size, decode_unicode=decode_unicode):
+            if pending is not None:
+                chunk = pending + chunk
+            if delimiter:
+                lines = chunk.split(delimiter)
+            else:
+                lines = chunk.splitlines()
+            if lines and lines[-1] and chunk and (lines[-1][-1] == chunk[-1]):
+                pending = lines.pop()
+            else:
+                pending = None
+            yield from lines
+        if pending is not None:
+            yield pending
+
+    @property
+    def content(self):
+        if self._content is False:
+            if self._content_consumed:
+                raise RuntimeError('The content for this response was already consumed')
+            if self.status_code == 0 or self.raw is None:
+                self._content = None
+            else:
+                self._content = b''.join(self.iter_content(CONTENT_CHUNK_SIZE)) or b''
+        self._content_consumed = True
+        return self._content
+
+    @property
+    def text(self):
+        content = None
+        encoding = self.encoding
+        if not self.content:
+            return ''
+        if self.encoding is None:
+            encoding = self.apparent_encoding
+        try:
+            content = str(self.content, encoding, errors='replace')
+        except (LookupError, TypeError):
+            content = str(self.content, errors='replace')
+        return content
+
+    def json(self, **kwargs):
+        if not self.encoding and self.content and (len(self.content) > 3):
+            encoding = guess_json_utf(self.content)
+            if encoding is not None:
+                try:
+                    return complexjson.loads(self.content.decode(encoding), **kwargs)
+                except UnicodeDecodeError:
+                    pass
+                except JSONDecodeError as e:
+                    raise RequestsJSONDecodeError(e.msg, e.doc, e.pos)
+        try:
+            return complexjson.loads(self.text, **kwargs)
+        except JSONDecodeError as e:
+            raise RequestsJSONDecodeError(e.msg, e.doc, e.pos)
+
+    @property
+    def links(self):
+        header = self.headers.get('link')
+        resolved_links = {}
+        if header:
+            links = parse_header_links(header)
+            for link in links:
+                key = link.get('rel') or link.get('url')
+                resolved_links[key] = link
+        return resolved_links
+
+    def raise_for_status(self):
+        http_error_msg = ''
+        if isinstance(self.reason, bytes):
+            try:
+                reason = self.reason.decode('utf-8')
+            except UnicodeDecodeError:
+                reason = self.reason.decode('iso-8859-1')
+        else:
+            reason = self.reason
+        if 400 <= self.status_code < 500:
+            http_error_msg = f'{self.status_code} Client Error: {reason} for url: {self.url}'
+        elif 500 <= self.status_code < 600:
+            http_error_msg = f'{self.status_code} Server Error: {reason} for url: {self.url}'
+        if http_error_msg:
+            raise HTTPError(http_error_msg, response=self)
+
+    def close(self):
+        if not self._content_consumed:
+            self.raw.close()
+        release_conn = getattr(self.raw, 'release_conn', None)
+        if release_conn is not None:
+            release_conn()
+def put(url, data=None, **kwargs):
+    kwargs.setdefault('allow_redirects', True)
+    return request('put', url, data=data, **kwargs)
+
+def patch(url, data=None, **kwargs):
+    kwargs.setdefault('allow_redirects', True)
+    return request('patch', url, data=data, **kwargs)
+
+def delete(url, **kwargs):
+    kwargs.setdefault('allow_redirects', True)
+    return request('delete', url, **kwargs)
+
+def head(url, **kwargs):
+    kwargs.setdefault('allow_redirects', False)
+    return request('head', url, **kwargs)
+
+def options(url, **kwargs):
+    kwargs.setdefault('allow_redirects', True)
+    return request('options', url, **kwargs)
+
+def session():
+    return Session()
+import codecs
+import contextlib
+import io
+import os
+import re
+import socket
+import struct
+import sys
+import tempfile
+import warnings
+import zipfile
+from collections import OrderedDict
+from urllib3.util import make_headers, parse_url
+from requests import certs
+from requests.__version__ import __version__
+from requests._internal_utils import _HEADER_VALIDATORS_BYTE, _HEADER_VALIDATORS_STR, HEADER_VALIDATORS, to_native_string
+from requests.compat import Mapping, basestring, bytes, getproxies, getproxies_environment, integer_types, is_urllib3_1
+from requests.compat import parse_http_list as _parse_list_header
+from requests.compat import proxy_bypass, proxy_bypass_environment, quote, str, unquote, urlparse, urlunparse
+from requests.cookies import cookiejar_from_dict
+from requests.exceptions import FileModeWarning, InvalidHeader, InvalidURL, UnrewindableBodyError
+from requests.structures import CaseInsensitiveDict
+NETRC_FILES = ('.netrc', '_netrc')
+DEFAULT_CA_BUNDLE_PATH = certs.where()
+DEFAULT_PORTS = {'http': 80, 'https': 443}
+DEFAULT_ACCEPT_ENCODING = ', '.join(re.split(',\\s*', make_headers(accept_encoding=True)['accept-encoding']))
+if sys.platform == 'win32':
+
+    def proxy_bypass_registry(host):
+        try:
+            import winreg
+        except ImportError:
+            return False
+        try:
+            internetSettings = winreg.OpenKey(winreg.HKEY_CURRENT_USER, 'Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings')
+            proxyEnable = int(winreg.QueryValueEx(internetSettings, 'ProxyEnable')[0])
+            proxyOverride = winreg.QueryValueEx(internetSettings, 'ProxyOverride')[0]
+        except (OSError, ValueError):
+            return False
+        if not proxyEnable or not proxyOverride:
+            return False
+        proxyOverride = proxyOverride.split(';')
+        proxyOverride = filter(None, proxyOverride)
+        for test in proxyOverride:
+            if test == '<local>':
+                if '.' not in host:
+                    return True
+            test = test.replace('.', '\\.')
+            test = test.replace('*', '.*')
+            test = test.replace('?', '.')
+            if re.match(test, host, re.I):
+                return True
+        return False
+
+    def proxy_bypass(host):
+        if getproxies_environment():
+            return proxy_bypass_environment(host)
+        else:
+            return proxy_bypass_registry(host)
+
+def dict_to_sequence(d):
+    if hasattr(d, 'items'):
+        d = d.items()
+    return d
+
+def super_len(o):
+    total_length = None
+    current_position = 0
+    if not is_urllib3_1 and isinstance(o, str):
+        o = o.encode('utf-8')
+    if hasattr(o, '__len__'):
+        total_length = len(o)
+    elif hasattr(o, 'len'):
+        total_length = o.len
+    elif hasattr(o, 'fileno'):
+        try:
+            fileno = o.fileno()
+        except (io.UnsupportedOperation, AttributeError):
+            pass
+        else:
+            total_length = os.fstat(fileno).st_size
+            if 'b' not in o.mode:
+                warnings.warn("Requests has determined the content-length for this request using the binary size of the file: however, the file has been opened in text mode (i.e. without the 'b' flag in the mode). This may lead to an incorrect content-length. In Requests 3.0, support will be removed for files in text mode.", FileModeWarning)
+    if hasattr(o, 'tell'):
+        try:
+            current_position = o.tell()
+        except OSError:
+            if total_length is not None:
+                current_position = total_length
+        else:
+            if hasattr(o, 'seek') and total_length is None:
+                try:
+                    o.seek(0, 2)
+                    total_length = o.tell()
+                    o.seek(current_position or 0)
+                except OSError:
+                    total_length = 0
+    if total_length is None:
+        total_length = 0
+    return max(0, total_length - current_position)
+
+def get_netrc_auth(url, raise_errors=False):
+    netrc_file = os.environ.get('NETRC')
+    if netrc_file is not None:
+        netrc_locations = (netrc_file,)
+    else:
+        netrc_locations = (f'~/{f}' for f in NETRC_FILES)
+    try:
+        from netrc import NetrcParseError, netrc
+        netrc_path = None
+        for f in netrc_locations:
+            loc = os.path.expanduser(f)
+            if os.path.exists(loc):
+                netrc_path = loc
+                break
+        if netrc_path is None:
+            return
+        ri = urlparse(url)
+        host = ri.hostname
+        try:
+            _netrc = netrc(netrc_path).authenticators(host)
+            if _netrc:
+                login_i = 0 if _netrc[0] else 1
+                return (_netrc[login_i], _netrc[2])
+        except (NetrcParseError, OSError):
+            if raise_errors:
+                raise
+    except (ImportError, AttributeError):
+        pass
+
+def guess_filename(obj):
+    name = getattr(obj, 'name', None)
+    if name and isinstance(name, basestring) and (name[0] != '<') and (name[-1] != '>'):
+        return os.path.basename(name)
+
+def extract_zipped_paths(path):
+    if os.path.exists(path):
+        return path
+    archive, member = os.path.split(path)
+    while archive and (not os.path.exists(archive)):
+        archive, prefix = os.path.split(archive)
+        if not prefix:
+            break
+        member = '/'.join([prefix, member])
+    if not zipfile.is_zipfile(archive):
+        return path
+    zip_file = zipfile.ZipFile(archive)
+    if member not in zip_file.namelist():
+        return path
+    tmp = tempfile.gettempdir()
+    extracted_path = os.path.join(tmp, member.split('/')[-1])
+    if not os.path.exists(extracted_path):
+        with atomic_open(extracted_path) as file_handler:
+            file_handler.write(zip_file.read(member))
+    return extracted_path
+
+@contextlib.contextmanager
+def atomic_open(filename):
+    tmp_descriptor, tmp_name = tempfile.mkstemp(dir=os.path.dirname(filename))
+    try:
+        with os.fdopen(tmp_descriptor, 'wb') as tmp_handler:
+            yield tmp_handler
+        os.replace(tmp_name, filename)
+    except BaseException:
+        os.remove(tmp_name)
+        raise
+
+def from_key_val_list(value):
+    if value is None:
+        return None
+    if isinstance(value, (str, bytes, bool, int)):
+        raise ValueError('cannot encode objects that are not 2-tuples')
+    return OrderedDict(value)
+
+def to_key_val_list(value):
+    if value is None:
+        return None
+    if isinstance(value, (str, bytes, bool, int)):
+        raise ValueError('cannot encode objects that are not 2-tuples')
+    if isinstance(value, Mapping):
+        value = value.items()
+    return list(value)
+
+def parse_list_header(value):
+    result = []
+    for item in _parse_list_header(value):
+        if item[:1] == item[-1:] == '"':
+            item = unquote_header_value(item[1:-1])
+        result.append(item)
+    return result
+
+def parse_dict_header(value):
+    result = {}
+    for item in _parse_list_header(value):
+        if '=' not in item:
+            result[item] = None
+            continue
+        name, value = item.split('=', 1)
+        if value[:1] == value[-1:] == '"':
+            value = unquote_header_value(value[1:-1])
+        result[name] = value
+    return result
+
+def unquote_header_value(value, is_filename=False):
+    if value and value[0] == value[-1] == '"':
+        value = value[1:-1]
+        if not is_filename or value[:2] != '\\\\':
+            return value.replace('\\\\', '\\').replace('\\"', '"')
+    return value
+
+def dict_from_cookiejar(cj):
+    cookie_dict = {cookie.name: cookie.value for cookie in cj}
+    return cookie_dict
+
+def add_dict_to_cookiejar(cj, cookie_dict):
+    return cookiejar_from_dict(cookie_dict, cj)
+
+def get_encodings_from_content(content):
+    warnings.warn('In requests 3.0, get_encodings_from_content will be removed. For more information, please see the discussion on issue #2266. (This warning should only appear once.)', DeprecationWarning)
+    charset_re = re.compile('<meta.*?charset=["\\\']*(.+?)["\\\'>]', flags=re.I)
+    pragma_re = re.compile('<meta.*?content=["\\\']*;?charset=(.+?)["\\\'>]', flags=re.I)
+    xml_re = re.compile('^<\\?xml.*?encoding=["\\\']*(.+?)["\\\'>]')
+    return charset_re.findall(content) + pragma_re.findall(content) + xml_re.findall(content)
+
+def _parse_content_type_header(header):
+    tokens = header.split(';')
+    content_type, params = (tokens[0].strip(), tokens[1:])
+    params_dict = {}
+    items_to_strip = '"\' '
+    for param in params:
+        param = param.strip()
+        if param:
+            key, value = (param, True)
+            index_of_equals = param.find('=')
+            if index_of_equals != -1:
+                key = param[:index_of_equals].strip(items_to_strip)
+                value = param[index_of_equals + 1:].strip(items_to_strip)
+            params_dict[key.lower()] = value
+    return (content_type, params_dict)
+
+def get_encoding_from_headers(headers):
+    content_type = headers.get('content-type')
+    if not content_type:
+        return None
+    content_type, params = _parse_content_type_header(content_type)
+    if 'charset' in params:
+        return params['charset'].strip('\'"')
+    if 'text' in content_type:
+        return 'ISO-8859-1'
+    if 'application/json' in content_type:
+        return 'utf-8'
+
+def stream_decode_response_unicode(iterator, r):
+    if r.encoding is None:
+        yield from iterator
+        return
+    decoder = codecs.getincrementaldecoder(r.encoding)(errors='replace')
+    for chunk in iterator:
+        rv = decoder.decode(chunk)
+        if rv:
+            yield rv
+    rv = decoder.decode(b'', final=True)
+    if rv:
+        yield rv
+
+def iter_slices(string, slice_length):
+    pos = 0
+    if slice_length is None or slice_length <= 0:
+        slice_length = len(string)
+    while pos < len(string):
+        yield string[pos:pos + slice_length]
+        pos += slice_length
+
+def get_unicode_from_response(r):
+    warnings.warn('In requests 3.0, get_unicode_from_response will be removed. For more information, please see the discussion on issue #2266. (This warning should only appear once.)', DeprecationWarning)
+    tried_encodings = []
+    encoding = get_encoding_from_headers(r.headers)
+    if encoding:
+        try:
+            return str(r.content, encoding)
+        except UnicodeError:
+            tried_encodings.append(encoding)
+    try:
+        return str(r.content, encoding, errors='replace')
+    except TypeError:
+        return r.content
+UNRESERVED_SET = frozenset('ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz' + '0123456789-._~')
+
+def unquote_unreserved(uri):
+    parts = uri.split('%')
+    for i in range(1, len(parts)):
+        h = parts[i][0:2]
+        if len(h) == 2 and h.isalnum():
+            try:
+                c = chr(int(h, 16))
+            except ValueError:
+                raise InvalidURL(f"Invalid percent-escape sequence: '{h}'")
+            if c in UNRESERVED_SET:
+                parts[i] = c + parts[i][2:]
+            else:
+                parts[i] = f'%{parts[i]}'
+        else:
+            parts[i] = f'%{parts[i]}'
+    return ''.join(parts)
+
+def requote_uri(uri):
+    safe_with_percent = "!#$%&'()*+,/:;=?@[]~"
+    safe_without_percent = "!#$&'()*+,/:;=?@[]~"
+    try:
+        return quote(unquote_unreserved(uri), safe=safe_with_percent)
+    except InvalidURL:
+        return quote(uri, safe=safe_without_percent)
+
+def address_in_network(ip, net):
+    ipaddr = struct.unpack('=L', socket.inet_aton(ip))[0]
+    netaddr, bits = net.split('/')
+    netmask = struct.unpack('=L', socket.inet_aton(dotted_netmask(int(bits))))[0]
+    network = struct.unpack('=L', socket.inet_aton(netaddr))[0] & netmask
+    return ipaddr & netmask == network & netmask
+
+def dotted_netmask(mask):
+    bits = 4294967295 ^ (1 << 32 - mask) - 1
+    return socket.inet_ntoa(struct.pack('>I', bits))
+
+def is_ipv4_address(string_ip):
+    try:
+        socket.inet_aton(string_ip)
+    except OSError:
+        return False
+    return True
+
+def is_valid_cidr(string_network):
+    if string_network.count('/') == 1:
+        try:
+            mask = int(string_network.split('/')[1])
+        except ValueError:
+            return False
+        if mask < 1 or mask > 32:
+            return False
+        try:
+            socket.inet_aton(string_network.split('/')[0])
+        except OSError:
+            return False
+    else:
+        return False
+    return True
+
+@contextlib.contextmanager
+def set_environ(env_name, value):
+    value_changed = value is not None
+    if value_changed:
+        old_value = os.environ.get(env_name)
+        os.environ[env_name] = value
+    try:
+        yield
+    finally:
+        if value_changed:
+            if old_value is None:
+                del os.environ[env_name]
+            else:
+                os.environ[env_name] = old_value
+
+def should_bypass_proxies(url, no_proxy):
+
+    def get_proxy(key):
+        return os.environ.get(key) or os.environ.get(key.upper())
+    no_proxy_arg = no_proxy
+    if no_proxy is None:
+        no_proxy = get_proxy('no_proxy')
+    parsed = urlparse(url)
+    if parsed.hostname is None:
+        return True
+    if no_proxy:
+        no_proxy = (host for host in no_proxy.replace(' ', '').split(',') if host)
+        if is_ipv4_address(parsed.hostname):
+            for proxy_ip in no_proxy:
+                if is_valid_cidr(proxy_ip):
+                    if address_in_network(parsed.hostname, proxy_ip):
+                        return True
+                elif parsed.hostname == proxy_ip:
+                    return True
+        else:
+            host_with_port = parsed.hostname
+            if parsed.port:
+                host_with_port += f':{parsed.port}'
+            for host in no_proxy:
+                if parsed.hostname.endswith(host) or host_with_port.endswith(host):
+                    return True
+    with set_environ('no_proxy', no_proxy_arg):
+        try:
+            bypass = proxy_bypass(parsed.hostname)
+        except (TypeError, socket.gaierror):
+            bypass = False
+    if bypass:
+        return True
+    return False
+
+def get_environ_proxies(url, no_proxy=None):
+    if should_bypass_proxies(url, no_proxy=no_proxy):
+        return {}
+    else:
+        return getproxies()
+
+def select_proxy(url, proxies):
+    proxies = proxies or {}
+    urlparts = urlparse(url)
+    if urlparts.hostname is None:
+        return proxies.get(urlparts.scheme, proxies.get('all'))
+    proxy_keys = [urlparts.scheme + '://' + urlparts.hostname, urlparts.scheme, 'all://' + urlparts.hostname, 'all']
+    proxy = None
+    for proxy_key in proxy_keys:
+        if proxy_key in proxies:
+            proxy = proxies[proxy_key]
+            break
+    return proxy
+
+def resolve_proxies(request, proxies, trust_env=True):
+    proxies = proxies if proxies is not None else {}
+    url = request.url
+    scheme = urlparse(url).scheme
+    no_proxy = proxies.get('no_proxy')
+    new_proxies = proxies.copy()
+    if trust_env and (not should_bypass_proxies(url, no_proxy=no_proxy)):
+        environ_proxies = get_environ_proxies(url, no_proxy=no_proxy)
+        proxy = environ_proxies.get(scheme, environ_proxies.get('all'))
+        if proxy:
+            new_proxies.setdefault(scheme, proxy)
+    return new_proxies
+
+def default_user_agent(name='python-requests'):
+    return f'{name}/{__version__}'
+
+def default_headers():
+    return CaseInsensitiveDict({'User-Agent': default_user_agent(), 'Accept-Encoding': DEFAULT_ACCEPT_ENCODING, 'Accept': '*/*', 'Connection': 'keep-alive'})
+
+def parse_header_links(value):
+    links = []
+    replace_chars = ' \'"'
+    value = value.strip(replace_chars)
+    if not value:
+        return links
+    for val in re.split(', *<', value):
+        try:
+            url, params = val.split(';', 1)
+        except ValueError:
+            url, params = (val, '')
+        link = {'url': url.strip('<> \'"')}
+        for param in params.split(';'):
+            try:
+                key, value = param.split('=')
+            except ValueError:
+                break
+            link[key.strip(replace_chars)] = value.strip(replace_chars)
+        links.append(link)
+    return links
+_null = '\x00'.encode('ascii')
+_null2 = _null * 2
+_null3 = _null * 3
+
+def guess_json_utf(data):
+    sample = data[:4]
+    if sample in (codecs.BOM_UTF32_LE, codecs.BOM_UTF32_BE):
+        return 'utf-32'
+    if sample[:3] == codecs.BOM_UTF8:
+        return 'utf-8-sig'
+    if sample[:2] in (codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE):
+        return 'utf-16'
+    nullcount = sample.count(_null)
+    if nullcount == 0:
+        return 'utf-8'
+    if nullcount == 2:
+        if sample[::2] == _null2:
+            return 'utf-16-be'
+        if sample[1::2] == _null2:
+            return 'utf-16-le'
+    if nullcount == 3:
+        if sample[:3] == _null3:
+            return 'utf-32-be'
+        if sample[1:] == _null3:
+            return 'utf-32-le'
+    return None
+
+def prepend_scheme_if_needed(url, new_scheme):
+    parsed = parse_url(url)
+    scheme, auth, host, port, path, query, fragment = parsed
+    netloc = parsed.netloc
+    if not netloc:
+        netloc, path = (path, netloc)
+    if auth:
+        netloc = '@'.join([auth, netloc])
+    if scheme is None:
+        scheme = new_scheme
+    if path is None:
+        path = ''
+    return urlunparse((scheme, netloc, path, '', query, fragment))
+
+def get_auth_from_url(url):
+    parsed = urlparse(url)
+    try:
+        auth = (unquote(parsed.username), unquote(parsed.password))
+    except (AttributeError, TypeError):
+        auth = ('', '')
+    return auth
+
+def check_header_validity(header):
+    name, value = header
+    _validate_header_part(header, name, 0)
+    _validate_header_part(header, value, 1)
+
+def _validate_header_part(header, header_part, header_validator_index):
+    if isinstance(header_part, str):
+        validator = _HEADER_VALIDATORS_STR[header_validator_index]
+    elif isinstance(header_part, bytes):
+        validator = _HEADER_VALIDATORS_BYTE[header_validator_index]
+    else:
+        raise InvalidHeader(f'Header part ({header_part!r}) from {header} must be of type str or bytes, not {type(header_part)}')
+    if not validator.match(header_part):
+        header_kind = 'name' if header_validator_index == 0 else 'value'
+        raise InvalidHeader(f'Invalid leading whitespace, reserved character(s), or return character(s) in header {header_kind}: {header_part!r}')
+
+def urldefragauth(url):
+    scheme, netloc, path, params, query, fragment = urlparse(url)
+    if not netloc:
+        netloc, path = (path, netloc)
+    netloc = netloc.rsplit('@', 1)[-1]
+    return urlunparse((scheme, netloc, path, params, query, ''))
+
+def rewind_body(prepared_request):
+    body_seek = getattr(prepared_request.body, 'seek', None)
+    if body_seek is not None and isinstance(prepared_request._body_position, integer_types):
+        try:
+            body_seek(prepared_request._body_position)
+        except OSError:
+            raise UnrewindableBodyError('An error occurred when rewinding request body for redirect.')
+    else:
+        raise UnrewindableBodyError('Unable to rewind request body for redirect.')
+import hashlib
+import os
+import re
+import threading
+import time
+import warnings
+from base64 import b64encode
+from requests._internal_utils import to_native_string
+from requests.compat import basestring, str, urlparse
+from requests.cookies import extract_cookies_to_jar
+from requests.utils import parse_dict_header
+CONTENT_TYPE_FORM_URLENCODED = 'application/x-www-form-urlencoded'
+CONTENT_TYPE_MULTI_PART = 'multipart/form-data'
+
+def _basic_auth_str(username, password):
+    if not isinstance(username, basestring):
+        warnings.warn("Non-string usernames will no longer be supported in Requests 3.0.0. Please convert the object you've passed in ({!r}) to a string or bytes object in the near future to avoid problems.".format(username), category=DeprecationWarning)
+        username = str(username)
+    if not isinstance(password, basestring):
+        warnings.warn("Non-string passwords will no longer be supported in Requests 3.0.0. Please convert the object you've passed in ({!r}) to a string or bytes object in the near future to avoid problems.".format(type(password)), category=DeprecationWarning)
+        password = str(password)
+    if isinstance(username, str):
+        username = username.encode('latin1')
+    if isinstance(password, str):
+        password = password.encode('latin1')
+    authstr = 'Basic ' + to_native_string(b64encode(b':'.join((username, password))).strip())
+    return authstr
+
+class AuthBase:
+
+    def __call__(self, r):
+        raise NotImplementedError('Auth hooks must be callable.')
+
+class HTTPBasicAuth(AuthBase):
+
+    def __init__(self, username, password):
+        self.username = username
+        self.password = password
+
+    def __eq__(self, other):
+        return all([self.username == getattr(other, 'username', None), self.password == getattr(other, 'password', None)])
+
+    def __ne__(self, other):
+        return not self == other
+
+    def __call__(self, r):
+        r.headers['Authorization'] = _basic_auth_str(self.username, self.password)
+        return r
+
+class HTTPProxyAuth(HTTPBasicAuth):
+
+    def __call__(self, r):
+        r.headers['Proxy-Authorization'] = _basic_auth_str(self.username, self.password)
+        return r
+
+class HTTPDigestAuth(AuthBase):
+
+    def __init__(self, username, password):
+        self.username = username
+        self.password = password
+        self._thread_local = threading.local()
+
+    def init_per_thread_state(self):
+        if not hasattr(self._thread_local, 'init'):
+            self._thread_local.init = True
+            self._thread_local.last_nonce = ''
+            self._thread_local.nonce_count = 0
+            self._thread_local.chal = {}
+            self._thread_local.pos = None
+            self._thread_local.num_401_calls = None
+
+    def build_digest_header(self, method, url):
+        realm = self._thread_local.chal['realm']
+        nonce = self._thread_local.chal['nonce']
+        qop = self._thread_local.chal.get('qop')
+        algorithm = self._thread_local.chal.get('algorithm')
+        opaque = self._thread_local.chal.get('opaque')
+        hash_utf8 = None
+        if algorithm is None:
+            _algorithm = 'MD5'
+        else:
+            _algorithm = algorithm.upper()
+        if _algorithm == 'MD5' or _algorithm == 'MD5-SESS':
+
+            def md5_utf8(x):
+                if isinstance(x, str):
+                    x = x.encode('utf-8')
+                return hashlib.md5(x).hexdigest()
+            hash_utf8 = md5_utf8
+        elif _algorithm == 'SHA':
+
+            def sha_utf8(x):
+                if isinstance(x, str):
+                    x = x.encode('utf-8')
+                return hashlib.sha1(x).hexdigest()
+            hash_utf8 = sha_utf8
+        elif _algorithm == 'SHA-256':
+
+            def sha256_utf8(x):
+                if isinstance(x, str):
+                    x = x.encode('utf-8')
+                return hashlib.sha256(x).hexdigest()
+            hash_utf8 = sha256_utf8
+        elif _algorithm == 'SHA-512':
+
+            def sha512_utf8(x):
+                if isinstance(x, str):
+                    x = x.encode('utf-8')
+                return hashlib.sha512(x).hexdigest()
+            hash_utf8 = sha512_utf8
+        KD = lambda s, d: hash_utf8(f'{s}:{d}')
+        if hash_utf8 is None:
+            return None
+        entdig = None
+        p_parsed = urlparse(url)
+        path = p_parsed.path or '/'
+        if p_parsed.query:
+            path += f'?{p_parsed.query}'
+        A1 = f'{self.username}:{realm}:{self.password}'
+        A2 = f'{method}:{path}'
+        HA1 = hash_utf8(A1)
+        HA2 = hash_utf8(A2)
+        if nonce == self._thread_local.last_nonce:
+            self._thread_local.nonce_count += 1
+        else:
+            self._thread_local.nonce_count = 1
+        ncvalue = f'{self._thread_local.nonce_count:08x}'
+        s = str(self._thread_local.nonce_count).encode('utf-8')
+        s += nonce.encode('utf-8')
+        s += time.ctime().encode('utf-8')
+        s += os.urandom(8)
+        cnonce = hashlib.sha1(s).hexdigest()[:16]
+        if _algorithm == 'MD5-SESS':
+            HA1 = hash_utf8(f'{HA1}:{nonce}:{cnonce}')
+        if not qop:
+            respdig = KD(HA1, f'{nonce}:{HA2}')
+        elif qop == 'auth' or 'auth' in qop.split(','):
+            noncebit = f'{nonce}:{ncvalue}:{cnonce}:auth:{HA2}'
+            respdig = KD(HA1, noncebit)
+        else:
+            return None
+        self._thread_local.last_nonce = nonce
+        base = f'username="{self.username}", realm="{realm}", nonce="{nonce}", uri="{path}", response="{respdig}"'
+        if opaque:
+            base += f', opaque="{opaque}"'
+        if algorithm:
+            base += f', algorithm="{algorithm}"'
+        if entdig:
+            base += f', digest="{entdig}"'
+        if qop:
+            base += f', qop="auth", nc={ncvalue}, cnonce="{cnonce}"'
+        return f'Digest {base}'
+
+    def handle_redirect(self, r, **kwargs):
+        if r.is_redirect:
+            self._thread_local.num_401_calls = 1
+
+    def handle_401(self, r, **kwargs):
+        if not 400 <= r.status_code < 500:
+            self._thread_local.num_401_calls = 1
+            return r
+        if self._thread_local.pos is not None:
+            r.request.body.seek(self._thread_local.pos)
+        s_auth = r.headers.get('www-authenticate', '')
+        if 'digest' in s_auth.lower() and self._thread_local.num_401_calls < 2:
+            self._thread_local.num_401_calls += 1
+            pat = re.compile('digest ', flags=re.IGNORECASE)
+            self._thread_local.chal = parse_dict_header(pat.sub('', s_auth, count=1))
+            r.content
+            r.close()
+            prep = r.request.copy()
+            extract_cookies_to_jar(prep._cookies, r.request, r.raw)
+            prep.prepare_cookies(prep._cookies)
+            prep.headers['Authorization'] = self.build_digest_header(prep.method, prep.url)
+            _r = r.connection.send(prep, **kwargs)
+            _r.history.append(r)
+            _r.request = prep
+            return _r
+        self._thread_local.num_401_calls = 1
+        return r
+
+    def __call__(self, r):
+        self.init_per_thread_state()
+        if self._thread_local.last_nonce:
+            r.headers['Authorization'] = self.build_digest_header(r.method, r.url)
+        try:
+            self._thread_local.pos = r.body.tell()
+        except AttributeError:
+            self._thread_local.pos = None
+        r.register_hook('response', self.handle_401)
+        r.register_hook('response', self.handle_redirect)
+        self._thread_local.num_401_calls = 1
+        return r
+
+    def __eq__(self, other):
+        return all([self.username == getattr(other, 'username', None), self.password == getattr(other, 'password', None)])
+
+    def __ne__(self, other):
+        return not self == other
+import importlib
+import sys
+from urllib3 import __version__ as urllib3_version
+try:
+    is_urllib3_1 = int(urllib3_version.split('.')[0]) == 1
+except (TypeError, AttributeError):
+    is_urllib3_1 = True
+
+def _resolve_char_detection():
+    chardet = None
+    for lib in ('chardet', 'charset_normalizer'):
+        if chardet is None:
+            try:
+                chardet = importlib.import_module(lib)
+            except ImportError:
+                pass
+    return chardet
+chardet = _resolve_char_detection()
+_ver = sys.version_info
+is_py2 = _ver[0] == 2
+is_py3 = _ver[0] == 3
+has_simplejson = False
+try:
+    import simplejson as json
+    has_simplejson = True
+except ImportError:
+    import json
+if has_simplejson:
+    from simplejson import JSONDecodeError
+else:
+    from json import JSONDecodeError
+from collections import OrderedDict
+from collections.abc import Callable, Mapping, MutableMapping
+from http import cookiejar as cookielib
+from http.cookies import Morsel
+from io import StringIO
+from urllib.parse import quote, quote_plus, unquote, unquote_plus, urldefrag, urlencode, urljoin, urlparse, urlsplit, urlunparse
+from urllib.request import getproxies, getproxies_environment, parse_http_list, proxy_bypass, proxy_bypass_environment
+builtin_str = str
+str = str
+bytes = bytes
+basestring = (str, bytes)
+numeric_types = (int, float)
+integer_types = (int,)
+import importlib
+import sys
+from urllib3 import __version__ as urllib3_version
+try:
+    is_urllib3_1 = int(urllib3_version.split('.')[0]) == 1
+except (TypeError, AttributeError):
+    is_urllib3_1 = True
+
+def _resolve_char_detection():
+    chardet = None
+    for lib in ('chardet', 'charset_normalizer'):
+        if chardet is None:
+            try:
+                chardet = importlib.import_module(lib)
+            except ImportError:
+                pass
+    return chardet
+chardet = _resolve_char_detection()
+_ver = sys.version_info
+is_py2 = _ver[0] == 2
+is_py3 = _ver[0] == 3
+has_simplejson = False
+try:
+    import simplejson as json
+    has_simplejson = True
+except ImportError:
+    import json
+if has_simplejson:
+    from simplejson import JSONDecodeError
+else:
+    from json import JSONDecodeError
+from collections import OrderedDict
+from collections.abc import Callable, Mapping, MutableMapping
+from http import cookiejar as cookielib
+from http.cookies import Morsel
+from io import StringIO
+from urllib.parse import quote, quote_plus, unquote, unquote_plus, urldefrag, urlencode, urljoin, urlparse, urlsplit, urlunparse
+from urllib.request import getproxies, getproxies_environment, parse_http_list, proxy_bypass, proxy_bypass_environment
+builtin_str = str
+str = str
+bytes = bytes
+basestring = (str, bytes)
+numeric_types = (int, float)
+integer_types = (int,)
+__import__('requests').status_codes = codes
+__import__('requests').codes = codes
+__import__('requests').put = put
+__import__('requests').patch = patch
+__import__('requests').delete = delete
+__import__('requests').head = head
+__import__('requests').options = options
+__import__('requests').session = session
+__import__('requests').request = request
 __import__('requests').get = get
-__import__('requests').post= post
+__import__('requests').post = post
 __import__('requests').Session = Session
+__import__('requests').Request = Request
+__import__('requests').PreparedRequest = PreparedRequest
+__import__('requests').Response = Response
+__import__('requests').HTTPAdapter = HTTPAdapter
+__import__('requests').BaseAdapter = BaseAdapter
+__import__('requests').exceptions = __import__('requests').exceptions
+__import__('requests').utils = __import__('requests').utils
+__import__('requests').cookies = __import__('requests').cookies
+__import__('requests').adapters = __import__('requests').adapters
+__import__('requests').auth = __import__('requests').auth
+__import__('requests').structures = __import__('requests').structures
+__import__('requests').hooks = __import__('requests').hooks
+__import__('requests').models = __import__('requests').models
+__import__('requests').models.Request = Request
+__import__('requests').models.PreparedRequest = PreparedRequest
+__import__('requests').models.Response = Response
+
+
 
 
 """
-
