@@ -1,28 +1,121 @@
-name: Run Python Script
+name: Nuitka MAX Build (Matrix OS)
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [ main ]
   workflow_dispatch:
 
 jobs:
-  run:
-    runs-on: ubuntu-latest
+  build:
+    name: Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            artifact: meo-linux
+            exe: meo
+          - os: windows-latest
+            artifact: meo-windows
+            exe: meo.exe
+          - os: macos-latest
+            artifact: meo-macos
+            exe: meo
+
+    env:
+      NUITKA_CCACHE_BINARY: ccache
 
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Setup Python 3.12
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      - name: Install dependencies (if any)
+      # ---------------- LINUX ----------------
+      - name: Install Linux toolchain
+        if: matrix.os == 'ubuntu-22.04'
         run: |
-          python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          sudo apt update
+          sudo apt install -y \
+            clang \
+            lld \
+            patchelf \
+            ccache \
+            upx \
+            build-essential
 
-      - name: Run Python file
+      # ---------------- MACOS ----------------
+      - name: Install macOS toolchain
+        if: matrix.os == 'macos-latest'
         run: |
-          python dss.py || true
+          brew update
+          brew install llvm upx
+
+      # ---------------- WINDOWS ----------------
+      - name: Install Windows toolchain
+        if: matrix.os == 'windows-latest'
+        run: |
+          choco install -y llvm upx
+        shell: powershell
+
+      - name: Upgrade pip
+        run: python -m pip install --upgrade pip
+
+      - name: Install Python dependencies
+        run: |
+          pip install nuitka
+          pip install requests httpx pystyle certifi idna urllib3
+
+      # ---------------- BUILD ----------------
+      - name: Nuitka MAX build
+        run: |
+          python -m nuitka meo.py \
+            --standalone \
+            --onefile \
+            --follow-imports \
+            --include-package=requests \
+            --include-package=httpx \
+            --include-package=pystyle \
+            --include-package=certifi \
+            --include-package=idna \
+            --include-package=urllib3 \
+            --lto=yes \
+            --strip=yes \
+            --static-libpython=no \
+            --no-pyi-file \
+            --disable-console \
+            --python-flag=no_warnings \
+            --python-flag=no_site \
+            --python-flag=isolated \
+            --nofollow-import-to=tkinter,unittest,pydoc,distutils,pkg_resources \
+            --onefile-cache-mode=temporary \
+            --remove-output \
+            --assume-yes-for-downloads \
+            --output-filename=meo
+
+      # ---------------- UPX ----------------
+      - name: UPX compress
+        run: |
+          upx --best --lzma meo* || true
+        shell: bash
+
+      # ---------------- VERIFY ----------------
+      - name: Verify binary
+        run: |
+          ls -lh meo*
+          file meo* || true
+        shell: bash
+
+      # ---------------- UPLOAD ----------------
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            meo
+            meo.exe
