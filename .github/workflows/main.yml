@@ -85,7 +85,6 @@ jobs:
             --include-package=idna \
             --include-package=urllib3 \
             --lto=yes \
-            --strip=yes \
             --static-libpython=no \
             --no-pyi-file \
             --disable-console \
