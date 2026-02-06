@@ -68,7 +68,7 @@ jobs:
 
       - name: Install Python dependencies
         run: |
-          pip install nuitka
+          pip install nuitka zstandard
           pip install requests httpx pystyle certifi idna urllib3
 
       # ---------------- BUILD ----------------
