@@ -74,28 +74,8 @@ jobs:
       # ---------------- BUILD ----------------
       - name: Nuitka MAX build
         run: |
-          python -m nuitka meo.py \
-            --standalone \
-            --onefile \
-            --follow-imports \
-            --include-package=requests \
-            --include-package=httpx \
-            --include-package=pystyle \
-            --include-package=certifi \
-            --include-package=idna \
-            --include-package=urllib3 \
-            --lto=yes \
-            --static-libpython=no \
-            --no-pyi-file \
-            --disable-console \
-            --python-flag=no_warnings \
-            --python-flag=no_site \
-            --python-flag=isolated \
-            --nofollow-import-to=tkinter,unittest,pydoc,distutils,pkg_resources \
-            --onefile-cache-mode=temporary \
-            --remove-output \
-            --assume-yes-for-downloads \
-            --output-filename=meo
+          python -m nuitka meo.py --standalone --onefile --follow-imports --include-package=requests --include-package=httpx --include-package=pystyle --include-package=certifi --include-package=idna --include-package=urllib3 --lto=yes --static-libpython=no --no-pyi-file --disable-console --python-flag=no_warnings --python-flag=no_site --python-flag=isolated --nofollow-import-to=tkinter,unittest,pydoc,distutils,pkg_resources --onefile-cache-mode=temporary --remove-output --assume-yes-for-downloads --output-filename=meo
+
 
       # ---------------- UPX ----------------
       - name: UPX compress
